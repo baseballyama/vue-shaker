@@ -1,0 +1,132 @@
+<!doctype html>
+<!--
+  Source for the social/OG card (1200x630). Regenerate public/og.png with:
+    open this file at 1200x630 and screenshot it (see packages/site — the repo
+    used Playwright: navigate to this file, viewport 1200x630, screenshot
+    -> ../public/og.png).
+-->
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <style>
+      @import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;600;800&family=JetBrains+Mono:wght@500;700&display=swap');
+      * {
+        margin: 0;
+        box-sizing: border-box;
+      }
+      html,
+      body {
+        width: 1200px;
+        height: 630px;
+      }
+      .card {
+        width: 1200px;
+        height: 630px;
+        position: relative;
+        overflow: hidden;
+        background:
+          radial-gradient(900px 520px at 82% -14%, rgba(66, 184, 131, 0.2), transparent 60%),
+          #0d1117;
+        color: #e7ecf0;
+        font-family: 'Inter', system-ui, sans-serif;
+        padding: 74px 84px;
+        display: flex;
+        flex-direction: column;
+        justify-content: space-between;
+      }
+      .top {
+        display: flex;
+        align-items: center;
+        gap: 30px;
+      }
+      .logo {
+        width: 128px;
+        height: 128px;
+        filter: drop-shadow(0 14px 32px rgba(66, 184, 131, 0.32));
+      }
+      .eyebrow {
+        font-family: 'JetBrains Mono', monospace;
+        font-size: 18px;
+        letter-spacing: 0.14em;
+        text-transform: uppercase;
+        color: #42b883;
+        margin-bottom: 8px;
+      }
+      .name {
+        font-size: 92px;
+        font-weight: 800;
+        letter-spacing: -0.045em;
+        line-height: 1;
+        background: linear-gradient(110deg, #e7ecf0 28%, #6ee7b7);
+        -webkit-background-clip: text;
+        background-clip: text;
+        color: transparent;
+      }
+      .tag {
+        font-size: 48px;
+        font-weight: 800;
+        letter-spacing: -0.03em;
+        line-height: 1.12;
+        max-width: 1010px;
+      }
+      .tag .g {
+        color: #42b883;
+      }
+      .chips {
+        display: flex;
+        gap: 14px;
+        flex-wrap: wrap;
+      }
+      .chip {
+        font-family: 'JetBrains Mono', monospace;
+        font-size: 20px;
+        font-weight: 500;
+        padding: 11px 18px;
+        border-radius: 11px;
+        border: 1px solid #2e3742;
+        color: #9aa6b2;
+        background: #161b22;
+      }
+      .chip .x {
+        color: #ff6b6b;
+        font-weight: 700;
+      }
+      .chip .ok {
+        color: #42b883;
+        font-weight: 700;
+      }
+      .foot {
+        display: flex;
+        align-items: center;
+        justify-content: space-between;
+        font-family: 'JetBrains Mono', monospace;
+        font-size: 23px;
+        color: #647082;
+      }
+      .foot .cmd {
+        color: #6ee7b7;
+      }
+    </style>
+  </head>
+  <body>
+    <div class="card">
+      <div class="top">
+        <img class="logo" src="../public/vue-shaker.png" alt="" />
+        <div>
+          <div class="eyebrow">whole-program · source-level · Vue 3</div>
+          <div class="name">vue-shaker</div>
+        </div>
+      </div>
+      <div class="tag">Deletes the <span class="g">dead code</span> your bundler can't see.</div>
+      <div class="chips">
+        <div class="chip"><span class="x">✕</span> Rollup can't read inside a .vue</div>
+        <div class="chip"><span class="x">✕</span> Vue ships every &lt;style scoped&gt; rule</div>
+        <div class="chip"><span class="ok">✓</span> vue-shaker drops the unreachable</div>
+      </div>
+      <div class="foot">
+        <span class="cmd">pnpm add -D vue-shaker</span>
+        <span>baseballyama.github.io/vue-shaker · MIT</span>
+      </div>
+    </div>
+  </body>
+</html>

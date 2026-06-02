@@ -4,11 +4,35 @@
     <meta charset="UTF-8" />
     <link rel="icon" type="image/png" href="/vue-shaker.png" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>vue-shaker — deletes the dead code your bundler can't see</title>
     <meta
       name="description"
-      content="A sound, source-level tree-shaker for Vue 3 SFCs."
+      content="A sound, whole-program tree-shaker for Vue 3 SFCs (script setup + defineProps): removes unreachable v-if branches and scoped CSS rules a bundler can't see, before the Vue compiler."
     />
-    <title>vue-shaker</title>
+
+    <!-- Open Graph (absolute URLs — crawlers don't resolve the deploy base) -->
+    <meta property="og:type" content="website" />
+    <meta property="og:site_name" content="vue-shaker" />
+    <meta property="og:title" content="vue-shaker — deletes the dead code your bundler can't see" />
+    <meta
+      property="og:description"
+      content="A sound, whole-program tree-shaker for Vue 3 SFCs: removes unreachable v-if branches and scoped CSS rules a bundler can't see."
+    />
+    <meta property="og:url" content="https://baseballyama.github.io/vue-shaker/" />
+    <meta property="og:image" content="https://baseballyama.github.io/vue-shaker/og.png" />
+    <meta property="og:image:type" content="image/png" />
+    <meta property="og:image:width" content="1200" />
+    <meta property="og:image:height" content="630" />
+    <meta property="og:image:alt" content="vue-shaker — deletes the dead code your bundler can't see" />
+
+    <!-- Twitter / X -->
+    <meta name="twitter:card" content="summary_large_image" />
+    <meta name="twitter:title" content="vue-shaker — deletes the dead code your bundler can't see" />
+    <meta
+      name="twitter:description"
+      content="A sound, whole-program tree-shaker for Vue 3 SFCs: removes unreachable v-if branches and scoped CSS rules a bundler can't see."
+    />
+    <meta name="twitter:image" content="https://baseballyama.github.io/vue-shaker/og.png" />
   </head>
   <body>
     <div id="app"></div>

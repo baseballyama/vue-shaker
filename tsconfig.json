@@ -1,0 +1,28 @@
+{
+  "extends": "@tsconfig/strictest/tsconfig.json",
+  "exclude": [
+    "**/dist/**",
+    "**/node_modules/**",
+    "**/.shaker-tmp*/**",
+    "**/tests/fixtures/**/actual/**",
+    "packages/site/**",
+    "packages/vue-shaker/engine-rs/**"
+  ],
+  "compilerOptions": {
+    "module": "esnext",
+    "lib": ["esnext", "dom", "dom.iterable"],
+    "target": "esnext",
+    "noEmit": true,
+    "moduleResolution": "bundler",
+    "resolveJsonModule": true,
+    "noEmitOnError": true,
+    "noErrorTruncation": true,
+    "allowSyntheticDefaultImports": true,
+    "verbatimModuleSyntax": true,
+    "types": ["node"],
+    "strict": true,
+    "allowJs": true,
+    "checkJs": true,
+    "declaration": true
+  }
+}

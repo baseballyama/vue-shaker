@@ -1,0 +1,30 @@
+{
+  "type": "module",
+  "scripts": {
+    "typecheck": "tsc --noEmit",
+    "lint": "oxlint",
+    "lint:fix": "oxlint --fix",
+    "format:check": "oxfmt --check .",
+    "format:fix": "oxfmt .",
+    "build": "pnpm --filter vue-shaker build",
+    "test": "pnpm --filter vue-shaker test",
+    "release": "changeset publish",
+    "all:check": "pnpm typecheck && pnpm lint && pnpm format:check",
+    "all:fix": "pnpm lint:fix && pnpm format:fix"
+  },
+  "devDependencies": {
+    "@changesets/cli": "2.31.0",
+    "@tsconfig/strictest": "2.0.5",
+    "@types/node": "20.12.12",
+    "oxfmt": "0.53.0",
+    "oxlint": "1.68.0",
+    "tsx": "^4.11.0",
+    "typescript": "5.4.5",
+    "vitest": "1.6.0"
+  },
+  "engines": {
+    "node": ">=18",
+    "pnpm": ">=9"
+  },
+  "packageManager": "pnpm@9.1.2"
+}

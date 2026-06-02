@@ -1,6 +1,6 @@
 {
   "name": "vue-shaker",
-  "version": "0.0.0",
+  "version": "0.1.0",
   "description": "Tree shaking for Vue components",
   "license": "MIT",
   "author": "baseballyama",
@@ -9,7 +9,25 @@
     "url": "git+https://github.com/baseballyama/vue-shaker.git",
     "directory": "packages/vue-shaker"
   },
+  "homepage": "https://github.com/baseballyama/vue-shaker#readme",
+  "bugs": "https://github.com/baseballyama/vue-shaker/issues",
+  "keywords": [
+    "vue",
+    "vue3",
+    "tree-shaking",
+    "tree-shaker",
+    "dead-code-elimination",
+    "sfc",
+    "vite-plugin",
+    "rollup-plugin",
+    "optimization",
+    "defineProps"
+  ],
   "type": "module",
+  "files": [
+    "dist",
+    "CHANGELOG.md"
+  ],
   "main": "./dist/index.js",
   "types": "./dist/types/index.d.ts",
   "exports": {

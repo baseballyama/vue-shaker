@@ -1,13 +1,20 @@
 <script setup lang="ts">
-import { ref, computed, watch, onUnmounted } from 'vue';
+import { ref, computed, watch, onUnmounted, onMounted } from 'vue';
 import { shake, type ShakeOutput, type Files } from './engine';
 import { presets, clonePresetFiles, type Preset } from './presets';
+import { loadHighlighter, tokenize, diffRows, type CodeHighlighter } from './highlight';
 
 const activePreset = ref<Preset>(presets[0]!);
 const files = ref<Files>(clonePresetFiles(presets[0]!));
-const activeFile = ref<string>(presets[0]!.entry);
+// Show the file where the shake is most visible first (falls back to entry).
+const activeFile = ref<string>(presets[0]!.focus ?? presets[0]!.entry);
 const result = ref<ShakeOutput | null>(null);
 const running = ref(false);
+
+const hl = ref<CodeHighlighter | null>(null);
+onMounted(async () => {
+  hl.value = await loadHighlighter();
+});
 
 const fileNames = computed(() => Object.keys(files.value));
 
@@ -21,7 +28,7 @@ function loadPreset(id: string): void {
   if (!p) return;
   activePreset.value = p;
   files.value = clonePresetFiles(p);
-  activeFile.value = p.entry;
+  activeFile.value = p.focus ?? p.entry;
 }
 
 function onInput(e: Event): void {
@@ -42,6 +49,16 @@ function onTab(e: KeyboardEvent): void {
   });
 }
 
+// Keep the highlighted overlay scrolled in lockstep with the textarea.
+const taEl = ref<HTMLTextAreaElement>();
+const hlEl = ref<HTMLElement>();
+function syncScroll(): void {
+  if (hlEl.value && taEl.value) {
+    hlEl.value.scrollTop = taEl.value.scrollTop;
+    hlEl.value.scrollLeft = taEl.value.scrollLeft;
+  }
+}
+
 // Debounced (~200ms) re-shake on every source change — fully client-side.
 let timer: ReturnType<typeof setTimeout> | undefined;
 watch(
@@ -59,10 +76,20 @@ watch(
 
 onUnmounted(() => clearTimeout(timer));
 
-const shakenActive = computed<string>(() => {
-  const out = result.value?.shaken[activeFile.value];
-  return out ?? files.value[activeFile.value] ?? '';
-});
+const source = computed<string>(() => files.value[activeFile.value] ?? '');
+const shakenActive = computed<string>(
+  () => result.value?.shaken[activeFile.value] ?? source.value,
+);
+
+/** Highlighted tokens for the editor overlay (null until Shiki has loaded). */
+const inputLines = computed(() => (hl.value ? tokenize(hl.value, source.value) : null));
+
+/** The "what was shaken" diff for the active file. */
+const diff = computed(() =>
+  hl.value && !result.value?.error ? diffRows(hl.value, source.value, shakenActive.value) : null,
+);
+
+const removedLines = computed(() => diff.value?.filter((r) => r.kind === 'del').length ?? 0);
 
 const changedFiles = computed<Set<string>>(() => {
   const set = new Set<string>();
@@ -118,13 +145,23 @@ function bytes(n: number): string {
           <span class="col-title">Source</span>
           <span class="col-sub">{{ label(activeFile) }} · editable</span>
         </div>
-        <textarea
-          class="code input"
-          spellcheck="false"
-          :value="files[activeFile]"
-          @input="onInput"
-          @keydown="onTab"
-        />
+        <div class="editor">
+          <pre ref="hlEl" class="hl" aria-hidden="true"><code><div
+            v-for="(line, i) in inputLines"
+            :key="i"
+            class="ln"
+          ><span v-for="(t, k) in line" :key="k" :style="{ color: t.color }">{{ t.content }}</span><span v-if="!line.length">&#8203;</span></div></code></pre>
+          <textarea
+            ref="taEl"
+            class="code input"
+            :class="{ raw: !inputLines }"
+            spellcheck="false"
+            :value="source"
+            @input="onInput"
+            @keydown="onTab"
+            @scroll="syncScroll"
+          />
+        </div>
       </div>
 
       <div class="col">
@@ -132,17 +169,25 @@ function bytes(n: number): string {
           <span class="col-title">Shaken</span>
           <span class="col-sub">
             <template v-if="running">shaking…</template>
-            <template v-else-if="result?.error" class="err">parse error</template>
-            <template v-else>output · read-only</template>
+            <template v-else-if="result?.error">⚠ parse error</template>
+            <template v-else-if="removedLines > 0">{{ removedLines }} lines removed ·
+              <span class="legend"><i class="sw del" />removed</span></template>
+            <template v-else>no change</template>
           </span>
         </div>
-        <textarea
-          class="code output"
-          :class="{ dim: running }"
-          spellcheck="false"
-          readonly
-          :value="result?.error ? '⚠ ' + result.error : shakenActive"
-        />
+
+        <pre v-if="result?.error" class="code output err">⚠ {{ result.error }}</pre>
+        <div v-else-if="diff" class="diff" :class="{ dim: running }">
+          <div v-for="(row, i) in diff" :key="i" class="row" :class="row.kind">
+            <span class="g">{{ row.kind === 'del' ? '-' : row.kind === 'add' ? '+' : '' }}</span>
+            <code class="ln"><span
+              v-for="(t, k) in row.line"
+              :key="k"
+              :style="{ color: t.color }"
+            >{{ t.content }}</span><span v-if="!row.line.length">&#8203;</span></code>
+          </div>
+        </div>
+        <pre v-else class="code output">{{ shakenActive }}</pre>
       </div>
     </div>
 
@@ -292,31 +337,133 @@ function bytes(n: number): string {
   color: var(--ink-faint);
   font-family: var(--mono);
 }
-.code {
-  width: 100%;
-  height: clamp(320px, 46vh, 540px);
-  resize: vertical;
-  border: none;
-  outline: none;
-  padding: 16px;
-  background: transparent;
-  color: var(--ink);
+.legend {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+}
+.legend .sw {
+  display: inline-block;
+  width: 9px;
+  height: 9px;
+  border-radius: 2px;
+}
+.legend .sw.del {
+  background: var(--del-bg);
+  border: 1px solid var(--del);
+}
+
+/* ---- shared code metrics (editor + diff must match exactly) ---- */
+.editor,
+.code,
+.diff {
+  height: clamp(340px, 52vh, 600px);
+}
+.code,
+.hl,
+.diff .ln,
+.diff .row {
+  font-family: var(--mono);
   font-size: 13px;
   line-height: 1.65;
   tab-size: 2;
+}
+
+/* ---- editor: transparent textarea over a highlighted <pre> ---- */
+.editor {
+  position: relative;
+  resize: vertical;
+  overflow: hidden;
+}
+.editor .hl {
+  position: absolute;
+  inset: 0;
+  margin: 0;
+  padding: 16px;
+  overflow: auto;
+  pointer-events: none;
+  white-space: pre;
+  background: var(--panel);
+}
+.editor .hl .ln {
+  display: block;
+  min-height: 1.65em;
+}
+.editor .code.input {
+  position: absolute;
+  inset: 0;
+  width: 100%;
+  height: 100%;
+  margin: 0;
+  padding: 16px;
+  border: none;
+  outline: none;
+  resize: none;
+  background: transparent;
+  color: transparent;
+  caret-color: var(--accent);
   white-space: pre;
   overflow: auto;
 }
-.code.input:focus {
+/* Before Shiki loads, show plain readable text instead of a blank box. */
+.editor .code.input.raw {
+  color: var(--ink);
+}
+.editor .code.input:focus {
   background: rgba(66, 184, 131, 0.03);
 }
-.code.output {
-  color: var(--ink-dim);
+
+/* ---- diff (shaken) output ---- */
+.diff {
+  overflow: auto;
   background: var(--bg-2);
+  padding: 16px 0;
 }
-.code.dim {
+.diff.dim {
   opacity: 0.5;
   transition: opacity 0.15s ease;
+}
+.diff .row {
+  display: flex;
+  white-space: pre;
+  min-height: 1.65em;
+}
+.diff .row .g {
+  flex: 0 0 22px;
+  text-align: center;
+  color: var(--ink-faint);
+  user-select: none;
+}
+.diff .row .ln {
+  white-space: pre;
+}
+.diff .row.del {
+  background: var(--del-bg);
+}
+.diff .row.del .g {
+  color: var(--del);
+}
+.diff .row.del .ln {
+  opacity: 0.85;
+}
+.diff .row.add {
+  background: var(--add-bg);
+}
+.diff .row.add .g {
+  color: var(--add);
+}
+
+.code.output {
+  width: 100%;
+  margin: 0;
+  padding: 16px;
+  background: var(--bg-2);
+  color: var(--ink-dim);
+  white-space: pre;
+  overflow: auto;
+}
+.code.output.err {
+  color: var(--del);
 }
 
 .stats {

@@ -1,7 +1,7 @@
 {
   "name": "vue-shaker",
   "version": "0.1.0",
-  "description": "Tree shaking for Vue components",
+  "description": "Source-level tree-shaker for Vue 3 SFCs — removes unreachable v-if branches and scoped CSS rules a bundler can't see",
   "keywords": [
     "dead-code-elimination",
     "defineProps",

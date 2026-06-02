@@ -12,16 +12,34 @@ const iconUrl = `${import.meta.env.BASE_URL}vue-shaker.png`;
       <div class="hero-text">
         <div class="eyebrow">whole-program · source-level · Vue 3</div>
         <h1>vue-shaker</h1>
-        <p class="tagline">A sound, source-level tree-shaker for Vue 3 SFCs</p>
+        <p class="tagline">Deletes the dead code your bundler can't see.</p>
         <p class="lede">
-          Design-system components carry dozens of props; your app uses a
-          handful. The code behind the rest — <code>v-if</code> arms, classes,
-          scoped CSS, the props themselves — ships anyway.
-          <strong>vue-shaker</strong> partial-evaluates each
-          <code>.vue</code> file against how the <em>whole app</em> actually
-          calls it, and deletes what can never run — <em>before</em> the Vue
-          compiler ever sees it.
+          Rollup tree-shakes JS modules — but it can't see inside a
+          <code>.vue</code>, and Vue compiles one generic render function per
+          component and prunes <em>no</em> CSS at all. So the
+          <code>.btn-danger</code> rule you never use, the
+          <code>v-if="loading"</code> spinner you never trigger, and the props
+          you never pass all ship — in <em>every</em> app that imports the
+          component. <strong>vue-shaker</strong> partial-evaluates each
+          <code>.vue</code> against how your <em>whole app</em> actually calls
+          it and removes what can never run — <em>before</em> the Vue compiler
+          sees it.
         </p>
+        <ul class="diffs">
+          <li>
+            <span class="x">Rollup / terser</span> can't read the runtime class
+            strings or template branches inside a <code>.vue</code>
+          </li>
+          <li>
+            <span class="x">Vue's compiler</span> emits every
+            <code>&lt;style scoped&gt;</code> rule, used or not
+          </li>
+          <li>
+            <span class="ok">vue-shaker</span> proves which prop values,
+            <code>v-if</code> arms and CSS rules your app can reach — and drops
+            the rest
+          </li>
+        </ul>
         <div class="cta">
           <a class="btn-primary" href="#playground">Try it below</a>
           <a class="btn-ghost" href="https://github.com/baseballyama/vue-shaker" rel="noreferrer">GitHub</a>
@@ -183,6 +201,44 @@ h1 {
 }
 .lede strong {
   color: var(--ink);
+}
+.diffs {
+  list-style: none;
+  margin: 18px 0 0;
+  padding: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 7px;
+  max-width: 66ch;
+}
+.diffs li {
+  font-size: 13px;
+  line-height: 1.5;
+  color: var(--ink-dim);
+}
+.diffs .x,
+.diffs .ok {
+  font-weight: 600;
+  font-family: var(--mono);
+  font-size: 12px;
+  padding: 1px 8px;
+  border-radius: 5px;
+  margin-right: 6px;
+  white-space: nowrap;
+}
+.diffs .x {
+  color: var(--del);
+  background: var(--del-bg);
+}
+.diffs .x::before {
+  content: '✕ ';
+}
+.diffs .ok {
+  color: var(--accent);
+  background: var(--accent-bg);
+}
+.diffs .ok::before {
+  content: '✓ ';
 }
 code {
   color: var(--accent-2);

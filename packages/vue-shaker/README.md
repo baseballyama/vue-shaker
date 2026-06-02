@@ -4,10 +4,17 @@
 
 <h1 align="center">vue-shaker</h1>
 
-<p align="center">A <strong>sound, source-level tree-shaker for Vue&nbsp;3 SFCs (<code>&lt;script setup&gt;</code> + <code>defineProps</code>).</strong></p>
+<p align="center"><strong>Deletes the dead code your bundler can't see</strong> — unreachable <code>v-if</code> branches and <code>&lt;style&nbsp;scoped&gt;</code> rules — from Vue&nbsp;3 SFCs.</p>
 
 **▶ Try it in the browser: https://baseballyama.github.io/vue-shaker/** — an
 interactive playground that runs the engine entirely client-side.
+
+Rollup tree-shakes JS modules, but it can't see inside a `.vue`; Vue compiles one
+generic render function per component and prunes **no** scoped CSS at all. So the
+`.btn-danger` rule you never use, the `v-if="loading"` arm you never trigger, and
+the props you never pass ship in **every** app that imports the component.
+`vue-shaker` is a **sound, whole-program tree-shaker** for Vue 3 SFCs
+(`<script setup>` + `defineProps`) that closes that gap.
 
 It runs in your app's production build, _before_ the Vue compiler, and slims each
 `.vue` file by partially evaluating it against how the **whole app** actually uses

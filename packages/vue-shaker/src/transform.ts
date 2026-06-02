@@ -160,8 +160,8 @@ function demoteFoldedProps(
   // Some props survive: surgically remove the folded ones, append the consts.
   const properties = model.propsPattern?.properties ?? [];
   for (const p of fold) {
-    removePatternProperty(properties, p.property, base, s);
-    removeTypeMember(model.definePropsCall, p.name, base, s);
+    removePatternProperty(properties, p.property, base, s, model.code);
+    removeTypeMember(model.definePropsCall, p.name, base, s, model.code);
   }
   s.appendLeft(declEnd, `\n${constLines}`);
   return dropped;
@@ -172,15 +172,10 @@ function removePatternProperty(
   property: AnyNode,
   base: number,
   s: MagicString,
+  code: string,
 ): void {
   const i = properties.indexOf(property);
-  const next = properties[i + 1];
-  const prev = properties[i - 1];
-  const start = base + (property.start ?? 0);
-  const end = base + (property.end ?? 0);
-  if (next) s.remove(start, base + (next.start ?? 0));
-  else if (prev) s.remove(base + (prev.end ?? 0), end);
-  else s.remove(start, end);
+  removeListItem(property, properties[i - 1], base, s, code);
 }
 
 /** Remove a prop's type member from `defineProps<{ … }>()`'s type literal. */
@@ -189,19 +184,51 @@ function removeTypeMember(
   name: string,
   base: number,
   s: MagicString,
+  code: string,
 ): void {
   const typeArg = definePropsCall?.typeParameters?.params?.[0];
   const members = typeArg?.members ?? [];
   const i = members.findIndex((m) => m.key?.type === 'Identifier' && m.key.name === name);
   if (i === -1) return;
-  const member = members[i]!;
-  const next = members[i + 1];
-  const prev = members[i - 1];
-  const start = base + (member.start ?? 0);
-  const end = base + (member.end ?? 0);
-  if (next) s.remove(start, base + (next.start ?? 0));
-  else if (prev) s.remove(base + (prev.end ?? 0), end);
-  else s.remove(start, end);
+  removeListItem(members[i]!, members[i - 1], base, s, code);
+}
+
+/**
+ * Remove one comma-separated list item (an object-pattern property or a type
+ * member) together with its separator, so no dangling `,` survives.  We delete
+ * the item plus the comma + whitespace that follows it; for a trailing item
+ * (no following comma before the closing `}`) we instead also consume the comma
+ * that precedes it.  The scan is on the *original* source, so overlapping
+ * removals across several siblings still compose correctly in MagicString.
+ */
+function removeListItem(
+  item: AnyNode,
+  prev: AnyNode | undefined,
+  base: number,
+  s: MagicString,
+  code: string,
+): void {
+  const start = base + (item.start ?? 0);
+  const end = base + (item.end ?? 0);
+
+  // Look for a trailing `,` after the item (skipping whitespace).
+  let after = end;
+  while (after < code.length && (code[after] === ' ' || code[after] === '\t')) after += 1;
+  if (code[after] === ',') {
+    // Consume the comma and the run of whitespace/newline after it.
+    let to = after + 1;
+    while (to < code.length && (code[to] === ' ' || code[to] === '\t' || code[to] === '\n'))
+      to += 1;
+    s.remove(start, to);
+    return;
+  }
+
+  // No trailing comma (item is last) — drop the preceding comma instead.
+  if (prev) {
+    s.remove(base + (prev.end ?? 0), end);
+    return;
+  }
+  s.remove(start, end);
 }
 
 function removeCallSiteAttributes(

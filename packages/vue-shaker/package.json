@@ -11,19 +11,19 @@
   },
   "type": "module",
   "main": "./dist/index.js",
-  "types": "./dist/types/src/index.d.ts",
+  "types": "./dist/types/index.d.ts",
   "exports": {
     ".": {
-      "types": "./dist/types/src/index.d.ts",
+      "types": "./dist/types/index.d.ts",
       "import": "./dist/index.js",
       "require": "./dist/index.cjs"
     },
     "./vite": {
-      "types": "./dist/types/src/vite.d.ts",
+      "types": "./dist/types/vite.d.ts",
       "import": "./dist/vite.js"
     },
     "./node": {
-      "types": "./dist/types/src/scan.d.ts",
+      "types": "./dist/types/scan.d.ts",
       "import": "./dist/scan.js"
     },
     "./package.json": "./package.json"

@@ -50,6 +50,10 @@ export function shaker(options: ShakerOptions = {}): Plugin {
     transform(code, id) {
       // Only the MAIN `.vue` request (no `?vue&type=…` subresource) is rewritten;
       // we hand the slimmed source to `@vitejs/plugin-vue`, which runs after us.
+      // `@vitejs/plugin-vue` re-requests each block as `App.vue?vue&type=script…`;
+      // those carry a query and must pass through untouched, or we would feed the
+      // whole SFC back in place of a single block and break esbuild.
+      if (id.includes('?')) return null;
       const file = id.split('?', 1)[0]!;
       if (!file.endsWith('.vue')) return null;
       const out = shaken[file] ?? shaken[path.normalize(file)];

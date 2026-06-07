@@ -1,8 +1,8 @@
 import * as path from 'node:path';
 import type { Plugin } from 'vite';
-import { analyze } from './analyze';
+import { analyze, type Resolve } from './analyze';
 import { transformAll } from './transform';
-import { collectVueFiles, fsReadFile, fsResolve } from './scan';
+import { collectScriptFiles, collectVueFiles, fsReadFile } from './scan';
 
 export interface ShakerOptions {
   /**
@@ -41,9 +41,28 @@ export function shaker(options: ShakerOptions = {}): Plugin {
     },
 
     async buildStart() {
-      const entries = include.flatMap((dir) => collectVueFiles(path.resolve(root, dir)));
+      const roots = include.map((dir) => path.resolve(root, dir));
+      const entries = roots.flatMap(collectVueFiles);
       if (entries.length === 0) return;
-      const { models, plans } = await analyze(entries, fsResolve, fsReadFile);
+      // Non-`.vue` files in scope are scanned for components that escape into
+      // script (programmatic `createApp`/`h`), whose props no template enumerates.
+      const escapeScanFiles = roots.flatMap(collectScriptFiles);
+      // Resolve through Vite so workspace packages (`@flyle/design-system-vue`),
+      // tsconfig/`resolve.alias` paths, and relative imports all resolve exactly
+      // as the real build does — `fsResolve` only handled `./` relative imports,
+      // which made design-system call sites (a bare workspace import) invisible
+      // and left the whole library unshaken.  Skip anything resolving into
+      // `node_modules`: published deps ship compiled and cannot be shaken, and
+      // crawling them would be pointless work.
+      const resolve: Resolve = async (source, importer) => {
+        // Arrow keeps `this` bound to the Rollup plugin context (`buildStart`).
+        const resolved = await this.resolve(source, importer, { skipSelf: true });
+        if (!resolved || resolved.external) return null;
+        const file = resolved.id.split('?', 1)[0]!;
+        if (file.includes('\0') || file.includes('/node_modules/')) return null;
+        return file;
+      };
+      const { models, plans } = await analyze(entries, resolve, fsReadFile, escapeScanFiles);
       shaken = transformAll(models, plans);
     },
 

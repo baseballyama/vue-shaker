@@ -2,6 +2,7 @@ import {
   exprContent,
   parseExpr,
   parseCached,
+  parseModuleProgram,
   parseVue,
   walkBabel,
   walkTemplate,
@@ -46,10 +47,16 @@ export interface FileModel {
   sfc: ParsedSfc;
   /** local import name (`Child`) -> resolved child component id. */
   imports: Map<string, ComponentId>;
-  /** Declared props, or `null` if the component has no destructured `defineProps`. */
+  /** Declared props, or `null` if the component has no `defineProps`. */
   props: PropDecl[] | null;
   /** The `const { … } = defineProps()` declarator's ObjectPattern, for editing. */
   propsPattern?: AnyNode | undefined;
+  /**
+   * The local name when props are NOT destructured (`const props =
+   * defineProps()` → `'props'`), so script reads `props.X` can be evaluated.
+   * Undefined for the destructured form (refs are then bare names).
+   */
+  propsLocal?: string | undefined;
   /** The whole `VariableDeclaration` statement (absolute span via scriptBase). */
   propsDeclaration?: AnyNode | undefined;
   /** The `defineProps<{…}>()` call, whose type args hold the prop type members. */
@@ -103,6 +110,8 @@ const MAX_FIXPOINT_ITERATIONS = 10;
 
 const ESCAPE_REASON = 'escapes as value (e.g. <component :is="X">)';
 const BARREL_REASON = 'rendered through a barrel/named import (call sites unobservable)';
+const NAMESPACE_LEAK_REASON =
+  'reached through a namespace object that also leaks as a value (call sites unobservable)';
 const SCRIPT_BASE_DEFAULT = 0;
 
 /** The absolute SFC base offset of a model's `<script setup>` (0 if none). */
@@ -114,8 +123,11 @@ export async function analyze(
   entries: ComponentId | ComponentId[],
   resolve: Resolve,
   readFile: ReadFile,
+  escapeScanFiles?: ComponentId[],
 ): Promise<AnalyzeResult> {
-  return analyzeInput(await buildAnalyzeInput(entries, resolve, readFile));
+  return analyzeInput(
+    await buildAnalyzeInput(entries, resolve, readFile, undefined, escapeScanFiles),
+  );
 }
 
 /**
@@ -142,6 +154,15 @@ export function analyzeInput(input: AnalyzeInput, parseCache?: ParseCache): Anal
   for (const id of barreled) {
     const model = models.get(id);
     if (model && !model.bailReasons.includes(BARREL_REASON)) model.bailReasons.push(BARREL_REASON);
+  }
+
+  // Forced bail (docs §4.1): the Shell proved a component's call sites are not
+  // fully enumerable during resolution (a leaking namespace object), so folding
+  // on the sites we DID see would be unsound.
+  for (const id of input.forcedBails ?? []) {
+    const model = models.get(id);
+    if (model && !model.bailReasons.includes(NAMESPACE_LEAK_REASON))
+      model.bailReasons.push(NAMESPACE_LEAK_REASON);
   }
 
   let plans = buildPlans(models, buildUsage(models, new Map()));
@@ -181,10 +202,15 @@ export async function buildAnalyzeInput(
   resolve: Resolve,
   readFile: ReadFile,
   parseCache?: ParseCache,
+  escapeScanFiles?: ComponentId[],
 ): Promise<AnalyzeInput> {
   const entryList = Array.isArray(entries) ? [...entries] : [entries];
   const files: InputFile[] = [];
   const edges: ResolvedEdge[] = [];
+  const forcedBails = new Set<ComponentId>();
+  // Parse a namespace barrel (`@flyle/design-system-vue`) at most once per
+  // (module, export) across the whole crawl — many files import the same object.
+  const nsCache = new Map<string, NamespaceTree | null>();
   const queue: ComponentId[] = [...entryList];
   const seen = new Set<ComponentId>(queue);
 
@@ -205,15 +231,20 @@ export async function buildAnalyzeInput(
       continue;
     }
     if (!sfc.scriptSetup) continue;
+    const program = sfc.scriptSetup.ast;
+
+    const imports = [...importSources(program)];
+    const importByLocal = new Map<string, ImportInfo>();
+    for (const imp of imports) importByLocal.set(imp.local, imp);
 
     const barrelLocals = new Map<string, ComponentId>();
-    const directChildren: ComponentId[] = [];
-    for (const imp of importSources(sfc.scriptSetup.ast)) {
+    const enqueue: ComponentId[] = [];
+    for (const imp of imports) {
       if (imp.imported === 'default' && isVue(imp.value)) {
         const childId = await resolve(imp.value, id);
         if (childId) {
           edges.push({ from: id, local: imp.local, to: childId, kind: 'default-vue' });
-          directChildren.push(childId);
+          enqueue.push(childId);
         }
         continue;
       }
@@ -224,15 +255,123 @@ export async function buildAnalyzeInput(
       }
     }
 
+    // Namespace-object pattern (docs §4.3): `import { NS } from 'pkg'; const { A,
+    // group: { B } } = NS;` then `<A/> <B/>`.  Resolve each destructured leaf to
+    // its `.vue` so the components fold like a plain default import — but only
+    // when `NS` does not ALSO leak as a runtime value (then its call sites are
+    // not enumerable and every component it exposes must bail).
+    for (const [nsLocal, ns] of collectNamespaceDestructures(program)) {
+      const imp = importByLocal.get(nsLocal);
+      if (!imp) continue;
+      const tree = await namespaceTreeCached(
+        imp.value,
+        imp.imported,
+        id,
+        resolve,
+        readFile,
+        nsCache,
+      );
+      if (!tree) continue;
+      const leaks =
+        ns.unsafe ||
+        namespaceLocalLeaks(program, nsLocal, ns.initNodes) ||
+        namespaceUsedInTemplateIs(sfc.template, nsLocal);
+      if (leaks) {
+        for (const compId of flattenNamespaceTree(tree)) forcedBails.add(compId);
+        continue;
+      }
+      for (const binding of ns.bindings) {
+        const childId = lookupNamespaceMember(tree, binding.path);
+        if (!childId) continue;
+        edges.push({ from: id, local: binding.local, to: childId, kind: 'namespace' });
+        enqueue.push(childId);
+      }
+    }
+
     const rendered = collectRenderedComponents(sfc.template, barrelLocals);
-    for (const childId of [...directChildren, ...rendered]) {
+    for (const childId of [...enqueue, ...rendered]) {
       if (!seen.has(childId)) {
         seen.add(childId);
         queue.push(childId);
       }
     }
   }
-  return { files, edges, entries: entryList };
+
+  // A `.vue` instantiated programmatically from a `.ts`/`.js` file
+  // (`createApp(Dialog, props)`, `h(Dialog, props)`) has call sites no template
+  // enumerates, so its props could be anything — bail it (docs §4.1).  Scanned in
+  // parallel; the `.includes('.vue')` fast-path skips files that import none.
+  const escapeLists = await Promise.all(
+    (escapeScanFiles ?? []).map((file) => collectScriptEscapes(file, resolve, readFile)),
+  );
+  for (const list of escapeLists) for (const id of list) forcedBails.add(id);
+
+  return { files, edges, entries: entryList, forcedBails: [...forcedBails] };
+}
+
+/**
+ * Components a non-`.vue` module imports and uses as a runtime VALUE — i.e. the
+ * default/namespace `.vue` import is referenced outside type positions and the
+ * import statement (e.g. `createApp(Dialog)`, `h(Dialog)`, stored in a config).
+ * Such use passes props the engine cannot see, so the component must bail.
+ */
+async function collectScriptEscapes(
+  file: ComponentId,
+  resolve: Resolve,
+  readFile: ReadFile,
+): Promise<ComponentId[]> {
+  let code: string;
+  try {
+    code = await readFile(file);
+  } catch {
+    return [];
+  }
+  if (!code.includes('.vue')) return []; // fast path: cannot import a `.vue`
+  const program = parseModuleProgram(code);
+  if (!program) return [];
+
+  const vueLocals = new Map<string, string>(); // local name -> `.vue` source spec
+  for (const stmt of (program.body as AnyNode[] | undefined) ?? []) {
+    if (stmt.type !== 'ImportDeclaration') continue;
+    const source = (stmt.source as AnyNode | undefined)?.value;
+    if (typeof source !== 'string' || !isVue(source)) continue;
+    for (const spec of stmt.specifiers ?? []) {
+      if (
+        (spec.type === 'ImportDefaultSpecifier' || spec.type === 'ImportNamespaceSpecifier') &&
+        spec.local?.name
+      )
+        vueLocals.set(spec.local.name, source);
+    }
+  }
+  if (vueLocals.size === 0) return [];
+
+  // A `.vue` imported ONLY to be bundled into an exported object as a shorthand
+  // property (`const Reg = { Modal }`) is the namespace pattern we already resolve
+  // soundly via the consumer's destructure — not a programmatic instantiation, so
+  // it must not bail.  A dangerous use (`createApp(Modal)`, `{ component: Modal }`)
+  // is NOT a shorthand property and is still flagged.
+  const shorthand = collectShorthandPropNodes(program);
+  const used = new Set<string>();
+  forEachValueIdentifier(program, (name, node) => {
+    if (vueLocals.has(name) && !shorthand.has(node)) used.add(name);
+  });
+  const ids = await Promise.all([...used].map((name) => resolve(vueLocals.get(name)!, file)));
+  return ids.filter((id): id is ComponentId => id != null);
+}
+
+/** Key + value nodes of every shorthand object-literal property (`{ X }`). */
+function collectShorthandPropNodes(program: AnyNode): Set<AnyNode> {
+  const out = new Set<AnyNode>();
+  walkBabel(program, (node) => {
+    if (node.type !== 'ObjectExpression') return;
+    for (const prop of node.properties ?? []) {
+      if ((prop.type === 'ObjectProperty' || prop.type === 'Property') && prop.shorthand) {
+        if (prop.key) out.add(prop.key);
+        if (prop.value) out.add(prop.value as AnyNode);
+      }
+    }
+  });
+  return out;
 }
 
 function buildUsage(
@@ -322,9 +461,13 @@ function buildModelFromInput(
   const sfc = parseCached(id, code, parseCache);
   const imports = new Map<string, ComponentId>();
   const barrelLocals = new Map<string, ComponentId>();
+  const namespaceLocals = new Set<string>();
   for (const edge of edges) {
     if (edge.kind === 'default-vue') imports.set(edge.local, edge.to);
-    else barrelLocals.set(edge.local, edge.to);
+    else if (edge.kind === 'namespace') {
+      imports.set(edge.local, edge.to);
+      namespaceLocals.add(edge.local);
+    } else barrelLocals.set(edge.local, edge.to);
   }
   const bailReasons: string[] = [];
 
@@ -337,6 +480,7 @@ function buildModelFromInput(
 
   let props: PropDecl[] | null = null;
   let propsPattern: AnyNode | undefined;
+  let propsLocal: string | undefined;
   let propsDeclaration: AnyNode | undefined;
   let definePropsCall: AnyNode | undefined;
   let hasRestProp = false;
@@ -345,31 +489,40 @@ function buildModelFromInput(
 
   if (sfc.scriptSetup) {
     for (const imp of importSources(sfc.scriptSetup.ast)) importedLocals.add(imp.local);
+    // Namespace-destructured component locals (`const { C } = NS`) are component
+    // references too — scan them for escapes (their binding site is excluded
+    // inside collectEscapedComponents, the same way import specifiers are).
+    for (const local of namespaceLocals) importedLocals.add(local);
 
     const found = findPropsDeclaration(sfc.scriptSetup.ast);
     if (found) {
       propsDeclaration = found.declaration;
       propsPattern = found.pattern;
+      propsLocal = found.propsLocal;
       definePropsCall = found.definePropsCall;
       sharesStatement = found.sharesStatement;
       if (found.sharesStatement)
         bailReasons.push('defineProps() shares a multi-declarator statement');
-      props = [];
-      for (const p of found.pattern.properties ?? []) {
-        if (p.type === 'RestElement') {
-          hasRestProp = true;
-          continue;
+      if (found.pattern) {
+        props = [];
+        for (const p of found.pattern.properties ?? []) {
+          if (p.type === 'RestElement') {
+            hasRestProp = true;
+            continue;
+          }
+          if (p.type !== 'ObjectProperty') continue;
+          const key = p.key;
+          if (key?.type !== 'Identifier' || !key.name) continue;
+          const value = p.value as AnyNode | undefined;
+          const inlineDefault = value?.type === 'AssignmentPattern' ? value.right : undefined;
+          props.push({
+            name: key.name,
+            property: p,
+            defaultExpr: inlineDefault ?? found.withDefaults.get(key.name),
+          });
         }
-        if (p.type !== 'ObjectProperty') continue;
-        const key = p.key;
-        if (key?.type !== 'Identifier' || !key.name) continue;
-        const value = p.value as AnyNode | undefined;
-        const inlineDefault = value?.type === 'AssignmentPattern' ? value.right : undefined;
-        props.push({
-          name: key.name,
-          property: p,
-          defaultExpr: inlineDefault ?? found.withDefaults.get(key.name),
-        });
+      } else {
+        props = propsFromTypeMembers(found.definePropsCall, found.withDefaults);
       }
     }
   }
@@ -377,6 +530,11 @@ function buildModelFromInput(
   const childCalls = collectChildCalls(sfc.template, imports);
   const barrelChildIds = collectRenderedComponents(sfc.template, barrelLocals);
   const shadowedNames = collectTemplateBindings(sfc);
+  // A prop whose name collides with an imported binding must not be folded: the
+  // destructured-form demote emits `const <name> = <value>`, which would redeclare
+  // the import (`Identifier '<name>' has already been declared`).  Treat imports
+  // as shadowing names so such props are left alone.
+  for (const local of importedLocals) shadowedNames.add(local);
   const escapedComponents = collectEscapedComponents(sfc, imports, importedLocals);
 
   return {
@@ -386,6 +544,7 @@ function buildModelFromInput(
     imports,
     props,
     propsPattern,
+    propsLocal,
     propsDeclaration,
     definePropsCall,
     hasRestProp,
@@ -506,6 +665,9 @@ function collectEscapedComponents(
       if (p.type === VueNode.DIRECTIVE && p.name === 'bind' && exprContentArg(p.arg) === 'is') {
         const ast = parseExpr(exprContent(p.exp));
         if (ast?.type === 'Identifier') flag(ast.name);
+        // `<component :is="Comp.Sub">` — the ROOT identifier is the component
+        // used as a value; flag it so a member-access `:is` is not a blind spot.
+        else if (ast?.type === 'MemberExpression') flag(memberRootName(ast));
       }
     }
   });
@@ -513,6 +675,11 @@ function collectEscapedComponents(
   // Script: a component identifier used as a runtime value.
   const ss = sfc.scriptSetup;
   if (ss) {
+    // Identifiers that DECLARE a binding (import specifiers, destructure
+    // patterns, params) are not value reads — excluding them lets a
+    // namespace-destructured component (`const { C } = NS`) be folded while a
+    // genuine value use of `C` elsewhere still escapes.
+    const bindingNodes = collectBindingIdentifierNodes(ss.ast);
     walkBabel(ss.ast, (node, parent) => {
       if (
         node.type === 'Identifier' &&
@@ -520,7 +687,8 @@ function collectEscapedComponents(
         imports.has(node.name) &&
         importedLocals.has(node.name) &&
         isValueUse(node, parent) &&
-        !isImportSpecifierPosition(parent)
+        !isImportSpecifierPosition(parent) &&
+        !bindingNodes.has(node)
       ) {
         flag(node.name);
       }
@@ -584,9 +752,374 @@ function collectRenderedComponents(
   return ids;
 }
 
+// ----------------------------------------------------------------------
+// Namespace-object component resolution (docs §4.3).
+//
+// A design system often ships its components as ONE object — e.g.
+//   // index.ts
+//   import FuiButton from './button/FuiButton.vue';
+//   const FuiComponents = { FuiText, button: { FuiButton } };
+//   export { FuiComponents };
+// and an app destructures off it:
+//   import { FuiComponents } from '@flyle/design-system-vue';
+//   const { FuiText, button: { FuiButton } } = FuiComponents;
+//   // <FuiText/> <FuiButton/>
+// Each leaf maps deterministically to one `.vue`, so the call sites ARE
+// enumerable and the components fold exactly like a default import — provided
+// the namespace object is not ALSO used as a runtime value (see the leak guard).
+// ----------------------------------------------------------------------
+
+/** A resolved namespace object: member name -> `.vue` id, or a nested sub-tree. */
+type NamespaceTree = Map<string, ComponentId | NamespaceTree>;
+
+/** One leaf binding of a `const { … } = NS` destructure: `path` into the tree. */
+interface NamespaceBinding {
+  path: string[];
+  local: string;
+}
+
+/** Everything one file destructures off a single namespace local. */
+interface NamespaceDestructure {
+  /** Every `= NS` init identifier node (for the leak guard's allow-set). */
+  initNodes: Set<AnyNode>;
+  bindings: NamespaceBinding[];
+  /** A rest element / default / computed key — the shape we cannot follow soundly. */
+  unsafe: boolean;
+}
+
+/** Find every `const <ObjectPattern> = <Identifier>` in a script, by RHS local. */
+function collectNamespaceDestructures(program: AnyNode): Map<string, NamespaceDestructure> {
+  const out = new Map<string, NamespaceDestructure>();
+  walkBabel(program, (node) => {
+    if (node.type !== 'VariableDeclarator') return;
+    const init = node.init;
+    const idPat = node.id;
+    if (init?.type !== 'Identifier' || !init.name || idPat?.type !== 'ObjectPattern') return;
+    let entry = out.get(init.name);
+    if (!entry) {
+      entry = { initNodes: new Set(), bindings: [], unsafe: false };
+      out.set(init.name, entry);
+    }
+    entry.initNodes.add(init);
+    collectPatternBindings(idPat, [], entry);
+  });
+  return out;
+}
+
+function collectPatternBindings(
+  pattern: AnyNode,
+  path: string[],
+  entry: NamespaceDestructure,
+): void {
+  for (const prop of pattern.properties ?? []) {
+    if (prop.type === 'RestElement') {
+      entry.unsafe = true; // `...rest` captures every other member as a value
+      continue;
+    }
+    if (prop.type !== 'ObjectProperty' && prop.type !== 'Property') continue;
+    if (prop.computed) {
+      entry.unsafe = true;
+      continue;
+    }
+    const keyName = staticKeyName(prop.key);
+    if (!keyName) {
+      entry.unsafe = true;
+      continue;
+    }
+    const value = (prop.value as AnyNode | undefined) ?? undefined;
+    if (value?.type === 'Identifier' && value.name) {
+      entry.bindings.push({ path: [...path, keyName], local: value.name });
+    } else if (value?.type === 'ObjectPattern') {
+      collectPatternBindings(value, [...path, keyName], entry);
+    } else {
+      // AssignmentPattern (default) / ArrayPattern — a member that might be absent
+      // or reshaped; folding from observed tags would be unsound, so bail safely.
+      entry.unsafe = true;
+    }
+  }
+}
+
+function staticKeyName(key: AnyNode | undefined): string | undefined {
+  if (key?.type === 'Identifier' && key.name) return key.name;
+  if (key?.type === 'StringLiteral' && typeof key.value === 'string') return key.value;
+  return undefined;
+}
+
+/** Resolve (and cache) the namespace object `imported` exports from `source`. */
+async function namespaceTreeCached(
+  source: string,
+  imported: string,
+  importer: ComponentId,
+  resolve: Resolve,
+  readFile: ReadFile,
+  cache: Map<string, NamespaceTree | null>,
+): Promise<NamespaceTree | null> {
+  const moduleId = await resolve(source, importer);
+  if (!moduleId) return null;
+  const key = `${moduleId} ${imported}`;
+  const cached = cache.get(key);
+  if (cached !== undefined) return cached;
+  const tree = await buildNamespaceTree(moduleId, imported, resolve, readFile);
+  cache.set(key, tree);
+  return tree;
+}
+
+/** Parse the module and turn the exported object literal into a {@link NamespaceTree}. */
+async function buildNamespaceTree(
+  moduleId: ComponentId,
+  exportName: string,
+  resolve: Resolve,
+  readFile: ReadFile,
+): Promise<NamespaceTree | null> {
+  let code: string;
+  try {
+    code = await readFile(moduleId);
+  } catch {
+    return null;
+  }
+  const body = parseModuleBody(code);
+  if (!body) return null;
+
+  // Module-local imports: `import X from './X.vue'` is a foldable leaf source.
+  const localImport = new Map<string, { value: string; imported: string }>();
+  for (const stmt of body) {
+    if (stmt.type !== 'ImportDeclaration') continue;
+    const value = (stmt.source as AnyNode | undefined)?.value;
+    if (typeof value !== 'string') continue;
+    for (const spec of stmt.specifiers ?? []) {
+      const local = spec.local?.name;
+      if (!local) continue;
+      if (spec.type === 'ImportDefaultSpecifier')
+        localImport.set(local, { value, imported: 'default' });
+      else if (spec.type === 'ImportSpecifier')
+        localImport.set(local, { value, imported: importedName(spec) ?? local });
+    }
+  }
+
+  const objectExpr = findExportedObject(body, exportName);
+  if (!objectExpr) return null;
+  return buildTreeFromObject(objectExpr, moduleId, localImport, resolve);
+}
+
+/** The `ObjectExpression` a module exports under `name` (local or `export const`). */
+function findExportedObject(body: AnyNode[], name: string): AnyNode | null {
+  for (const stmt of body) {
+    if (
+      stmt.type === 'ExportNamedDeclaration' &&
+      stmt.declaration?.type === 'VariableDeclaration'
+    ) {
+      const obj = objectFromDeclaration(stmt.declaration, name);
+      if (obj) return obj;
+    }
+    if (stmt.type === 'VariableDeclaration') {
+      const obj = objectFromDeclaration(stmt, name);
+      if (obj) return obj;
+    }
+    if (
+      stmt.type === 'ExportDefaultDeclaration' &&
+      name === 'default' &&
+      stmt.declaration?.type === 'ObjectExpression'
+    ) {
+      return stmt.declaration;
+    }
+  }
+  return null;
+}
+
+function objectFromDeclaration(decl: AnyNode, name: string): AnyNode | null {
+  for (const d of decl.declarations ?? []) {
+    if (d.id?.type === 'Identifier' && d.id.name === name && d.init?.type === 'ObjectExpression')
+      return d.init;
+  }
+  return null;
+}
+
+async function buildTreeFromObject(
+  obj: AnyNode,
+  moduleId: ComponentId,
+  localImport: Map<string, { value: string; imported: string }>,
+  resolve: Resolve,
+): Promise<NamespaceTree> {
+  const tree: NamespaceTree = new Map();
+  // Resolve every member in parallel — one tree is built once per barrel, but a
+  // sequential `await resolve` per member would still be a needless N+1.
+  const entries = await Promise.all(
+    (obj.properties ?? []).map(
+      async (prop): Promise<[string, ComponentId | NamespaceTree] | null> => {
+        if (prop.type !== 'ObjectProperty' && prop.type !== 'Property') return null;
+        if (prop.computed) return null;
+        const keyName = staticKeyName(prop.key);
+        if (!keyName) return null;
+        const value = prop.value as AnyNode | undefined;
+        if (value?.type === 'Identifier' && value.name) {
+          const imp = localImport.get(value.name);
+          if (!imp || imp.imported !== 'default' || !isVue(imp.value)) return null;
+          const compId = await resolve(imp.value, moduleId);
+          return compId ? [keyName, compId] : null;
+        }
+        if (value?.type === 'ObjectExpression') {
+          return [keyName, await buildTreeFromObject(value, moduleId, localImport, resolve)];
+        }
+        return null;
+      },
+    ),
+  );
+  for (const e of entries) if (e) tree.set(e[0], e[1]);
+  return tree;
+}
+
+/** Walk a member path into the tree; null unless it ends on a concrete `.vue` id. */
+function lookupNamespaceMember(tree: NamespaceTree, path: string[]): ComponentId | null {
+  let cur: ComponentId | NamespaceTree = tree;
+  for (const key of path) {
+    if (typeof cur === 'string') return null;
+    const next = cur.get(key);
+    if (next === undefined) return null;
+    cur = next;
+  }
+  return typeof cur === 'string' ? cur : null;
+}
+
+/** Every `.vue` id reachable in the tree (used to bail a leaking namespace). */
+function flattenNamespaceTree(tree: NamespaceTree): ComponentId[] {
+  const out: ComponentId[] = [];
+  for (const v of tree.values()) {
+    if (typeof v === 'string') out.push(v);
+    else out.push(...flattenNamespaceTree(v));
+  }
+  return out;
+}
+
+/** Type-only AST fields: `typeof NS` inside them is erased, never a runtime read. */
+const TYPE_ONLY_KEYS = new Set(['typeAnnotation', 'typeParameters', 'returnType', 'typeArguments']);
+
+/**
+ * True when the namespace local is used as a RUNTIME VALUE anywhere other than
+ * the `= NS` destructure inits we already followed.  Such a use (e.g. passing
+ * `NS` to a function, `NS.x.y` in an expression) can reach components through
+ * sites we cannot enumerate, so the whole object must bail.  Import bindings and
+ * type positions (`typeof NS`) are erased/not value reads and are skipped.
+ */
+function namespaceLocalLeaks(program: AnyNode, nsLocal: string, initNodes: Set<AnyNode>): boolean {
+  let leak = false;
+  forEachValueIdentifier(program, (name, node) => {
+    if (name === nsLocal && !initNodes.has(node)) leak = true;
+  });
+  return leak;
+}
+
+/**
+ * Visit every identifier in a RUNTIME VALUE position: skips import declarations
+ * (bindings) and type-only AST fields (`typeof X` in a type is erased).  Over-
+ * approximates — member-property and object-key identifiers are visited too —
+ * which only ever causes a (sound) extra bail, never a missed escape.
+ */
+function forEachValueIdentifier(
+  node: AnyNode | null | undefined,
+  fn: (name: string, node: AnyNode) => void,
+): void {
+  if (!node || typeof node !== 'object' || typeof node.type !== 'string') return;
+  if (node.type === 'ImportDeclaration') return;
+  if (node.type === 'Identifier') {
+    if (node.name) fn(node.name, node);
+    return;
+  }
+  for (const [key, v] of Object.entries(node)) {
+    if (TYPE_ONLY_KEYS.has(key)) continue;
+    if (Array.isArray(v)) for (const it of v) forEachValueIdentifier(it as AnyNode, fn);
+    else if (v && typeof v === 'object' && typeof (v as AnyNode).type === 'string')
+      forEachValueIdentifier(v as AnyNode, fn);
+  }
+}
+
+/**
+ * Every identifier node that DECLARES a binding (import specifier, destructure
+ * pattern, function parameter) rather than reading a value.  Used to exclude the
+ * `const { C } = NS` binding site from escape detection, just as import
+ * specifiers are excluded — a real value use of `C` elsewhere still escapes.
+ */
+function collectBindingIdentifierNodes(program: AnyNode): Set<AnyNode> {
+  const out = new Set<AnyNode>();
+  walkBabel(program, (node) => {
+    if (node.type === 'VariableDeclarator') addPatternIdentifierNodes(node.id, out);
+    else if (
+      node.type === 'FunctionDeclaration' ||
+      node.type === 'FunctionExpression' ||
+      node.type === 'ArrowFunctionExpression' ||
+      node.type === 'ObjectMethod' ||
+      node.type === 'ClassMethod'
+    ) {
+      for (const p of node.params ?? []) addPatternIdentifierNodes(p, out);
+    } else if (
+      node.type === 'ImportDefaultSpecifier' ||
+      node.type === 'ImportSpecifier' ||
+      node.type === 'ImportNamespaceSpecifier'
+    ) {
+      if (node.local) out.add(node.local);
+    }
+  });
+  return out;
+}
+
+function addPatternIdentifierNodes(pattern: AnyNode | null | undefined, out: Set<AnyNode>): void {
+  if (!pattern) return;
+  switch (pattern.type) {
+    case 'Identifier':
+      out.add(pattern);
+      return;
+    case 'ObjectPattern':
+      for (const prop of pattern.properties ?? []) {
+        if (prop.type === 'RestElement') {
+          addPatternIdentifierNodes(prop.argument, out);
+        } else if (prop.type === 'ObjectProperty' || prop.type === 'Property') {
+          addPatternIdentifierNodes((prop.value as AnyNode) ?? prop.key, out);
+          // A shorthand `{ Foo }` binding emits a DISTINCT key node (same name,
+          // same range) the walk visits separately; exclude it too or it reads
+          // as a value use and escapes.
+          if (prop.shorthand && prop.key) out.add(prop.key);
+        }
+      }
+      return;
+    case 'ArrayPattern':
+      for (const el of pattern.elements ?? []) addPatternIdentifierNodes(el, out);
+      return;
+    case 'AssignmentPattern':
+      addPatternIdentifierNodes(pattern.left, out);
+      return;
+    case 'RestElement':
+      addPatternIdentifierNodes(pattern.argument, out);
+      return;
+    default:
+      return;
+  }
+}
+
 /** The `.content` of a SimpleExpressionNode that is also static (`arg`). */
 function exprContentArg(arg: AnyNode | undefined): string | undefined {
   return exprContent(arg);
+}
+
+/** Root object identifier of a (possibly nested) member expression, if any. */
+function memberRootName(node: AnyNode | undefined): string | undefined {
+  let cur = node;
+  while (cur?.type === 'MemberExpression') cur = cur.object;
+  return cur?.type === 'Identifier' ? cur.name : undefined;
+}
+
+/** True if a `<component :is>` renders through the namespace local (`NS.a.B`). */
+function namespaceUsedInTemplateIs(template: AnyNode | undefined, nsLocal: string): boolean {
+  let found = false;
+  walkTemplate(template, (node) => {
+    if (node.type !== VueNode.ELEMENT) return;
+    for (const p of node.props ?? []) {
+      if (p.type !== VueNode.DIRECTIVE || p.name !== 'bind' || exprContentArg(p.arg) !== 'is')
+        continue;
+      const ast = parseExpr(exprContent(p.exp));
+      if (ast?.type === 'Identifier' ? ast.name === nsLocal : memberRootName(ast) === nsLocal)
+        found = true;
+    }
+  });
+  return found;
 }
 
 /**
@@ -881,51 +1414,92 @@ function parseModuleBody(code: string): AnyNode[] | null {
 
 interface FoundProps {
   declaration: AnyNode;
-  pattern: AnyNode;
+  /** The destructure ObjectPattern, or undefined for `const props = defineProps()`. */
+  pattern: AnyNode | undefined;
+  /** The props local name (`props`) for the non-destructured form, else undefined. */
+  propsLocal: string | undefined;
   definePropsCall: AnyNode | undefined;
   withDefaults: Map<string, AnyNode>;
   sharesStatement: boolean;
 }
 
 /**
- * Find `const { … } = defineProps(...)` or `const { … } = withDefaults(defineProps(...), {…})`.
- * Returns the destructure pattern, the `defineProps` call (for type-member edits),
- * and the `withDefaults` defaults map.
+ * Find the `defineProps` declaration in either supported form:
+ *   - destructured:     `const { … } = defineProps(...)` / `withDefaults(...)`
+ *   - non-destructured: `const props = defineProps<{…}>()` / `withDefaults(...)`
+ * Returns the pattern (destructured) or the props local name (non-destructured),
+ * the `defineProps` call (for type-member edits) and the `withDefaults` defaults.
  */
 function findPropsDeclaration(program: AnyNode): FoundProps | null {
   const body = (program.body as AnyNode[] | undefined) ?? [];
   for (const stmt of body) {
     if (stmt.type !== 'VariableDeclaration') continue;
     for (const decl of stmt.declarations ?? []) {
-      const init = decl.init;
+      const extracted = extractDefineProps(decl.init);
+      if (!extracted) continue;
       const id = decl.id;
-      if (id?.type !== 'ObjectPattern' || init?.type !== 'CallExpression') continue;
-      const calleeName = init.callee?.type === 'Identifier' ? init.callee.name : undefined;
-
-      if (calleeName === 'defineProps') {
+      const sharesStatement = (stmt.declarations?.length ?? 1) > 1;
+      if (id?.type === 'ObjectPattern') {
         return {
           declaration: stmt,
           pattern: id,
-          definePropsCall: init,
-          withDefaults: new Map(),
-          sharesStatement: (stmt.declarations?.length ?? 1) > 1,
+          propsLocal: undefined,
+          sharesStatement,
+          ...extracted,
         };
       }
-      if (calleeName === 'withDefaults') {
-        const inner = init.arguments?.[0];
-        if (inner?.type !== 'CallExpression' || inner.callee?.type !== 'Identifier') continue;
-        if (inner.callee.name !== 'defineProps') continue;
+      if (id?.type === 'Identifier' && id.name) {
         return {
           declaration: stmt,
-          pattern: id,
-          definePropsCall: inner,
-          withDefaults: defaultsFromObject(init.arguments?.[1]),
-          sharesStatement: (stmt.declarations?.length ?? 1) > 1,
+          pattern: undefined,
+          propsLocal: id.name,
+          sharesStatement,
+          ...extracted,
         };
       }
     }
   }
   return null;
+}
+
+/** Pull the `defineProps` call + `withDefaults` map out of a declarator init. */
+function extractDefineProps(
+  init: AnyNode | null | undefined,
+): { definePropsCall: AnyNode; withDefaults: Map<string, AnyNode> } | null {
+  if (init?.type !== 'CallExpression') return null;
+  const calleeName = init.callee?.type === 'Identifier' ? init.callee.name : undefined;
+  if (calleeName === 'defineProps') return { definePropsCall: init, withDefaults: new Map() };
+  if (calleeName === 'withDefaults') {
+    const inner = init.arguments?.[0];
+    if (
+      inner?.type !== 'CallExpression' ||
+      inner.callee?.type !== 'Identifier' ||
+      inner.callee.name !== 'defineProps'
+    )
+      return null;
+    return { definePropsCall: inner, withDefaults: defaultsFromObject(init.arguments?.[1]) };
+  }
+  return null;
+}
+
+/**
+ * Declared props of a non-destructured `defineProps<{…}>()`: names come from the
+ * type literal's members, defaults from the `withDefaults` map.  `property` is the
+ * type member node (only the destructured path edits the signature, so it is
+ * never used to remove a pattern entry here).
+ */
+function propsFromTypeMembers(
+  definePropsCall: AnyNode | undefined,
+  withDefaults: Map<string, AnyNode>,
+): PropDecl[] {
+  const out: PropDecl[] = [];
+  const typeArg = definePropsCall?.typeParameters?.params?.[0];
+  for (const m of typeArg?.members ?? []) {
+    const key = m.key;
+    if (key?.type !== 'Identifier' || !key.name) continue;
+    out.push({ name: key.name, property: m, defaultExpr: withDefaults.get(key.name) });
+  }
+  return out;
 }
 
 /** Map of `{ name: defaultExpr }` from a `withDefaults` second-argument object. */

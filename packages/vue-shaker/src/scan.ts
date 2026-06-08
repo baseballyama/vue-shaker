@@ -38,3 +38,30 @@ export function collectVueFiles(dir: string): ComponentId[] {
   }
   return out;
 }
+
+const SCRIPT_RE = /\.(?:ts|tsx|js|jsx|mjs|cjs)$/;
+
+/**
+ * Recursively collect every `.ts`/`.js`(x)/`.mjs`/`.cjs` file under `dir`
+ * (skipping `node_modules`, dot-dirs, and `.d.ts`).  These are scanned for
+ * components that escape into script — a `.vue` imported and instantiated
+ * programmatically (`createApp(Dialog, props)`) has call sites no template
+ * enumerates, so its props must not be folded (docs §4.1).
+ */
+export function collectScriptFiles(dir: string): ComponentId[] {
+  const out: ComponentId[] = [];
+  let entries: fs.Dirent[];
+  try {
+    entries = fs.readdirSync(dir, { withFileTypes: true });
+  } catch {
+    return out;
+  }
+  for (const entry of entries) {
+    if (entry.name === 'node_modules' || entry.name.startsWith('.')) continue;
+    const full = path.join(dir, entry.name);
+    if (entry.isDirectory()) out.push(...collectScriptFiles(full));
+    else if (entry.isFile() && SCRIPT_RE.test(entry.name) && !entry.name.endsWith('.d.ts'))
+      out.push(full);
+  }
+  return out;
+}

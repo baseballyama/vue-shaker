@@ -58,6 +58,8 @@ export interface AnyNode {
   key?: AnyNode | undefined;
   id?: AnyNode | undefined;
   init?: AnyNode | null | undefined;
+  /** `VariableDeclaration.kind`: `'const' | 'let' | 'var'`. */
+  kind?: string | undefined;
   declarations?: AnyNode[] | undefined;
   declaration?: AnyNode | null | undefined;
   specifiers?: AnyNode[] | undefined;
@@ -178,6 +180,20 @@ function babelProgram(content: string): AnyNode {
     plugins: [...TS_PLUGINS],
   }) as unknown as { program: AnyNode };
   return file.program;
+}
+
+/**
+ * Parse a standalone `.ts`/`.js` module into a Babel `Program`, or null if it
+ * does not parse.  Used to scan non-`.vue` files in scope for components that
+ * escape into script (e.g. `createApp(Dialog, props)`), whose props are passed
+ * outside any template call site and so must bail.
+ */
+export function parseModuleProgram(code: string): AnyNode | null {
+  try {
+    return babelProgram(code);
+  } catch {
+    return null;
+  }
 }
 
 /**

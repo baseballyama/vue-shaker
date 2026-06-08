@@ -21,6 +21,7 @@ export type Literal = string | number | boolean | null | undefined;
 /** How an imported local name binds to a child `.vue` component. */
 export type EdgeKind =
   | 'default-vue' // `import Child from './Child.vue'` — drives the value sets
+  | 'namespace' // destructured off a namespace object (`const { C } = NS`) — drives value sets
   | 'barrel'; // reached through a named/namespace or `.js`/`.ts` barrel re-export
 
 /** One reachable `.vue` source the engine will model. */
@@ -47,6 +48,13 @@ export interface AnalyzeInput {
   files: InputFile[];
   edges: ResolvedEdge[];
   entries: ComponentId[];
+  /**
+   * Components the Shell proved unsafe to fold during resolution — e.g. a
+   * namespace object (`const { C } = NS`) that ALSO leaks as a runtime value, so
+   * some of its call sites are not enumerable.  The engine bails these wholesale,
+   * exactly as it bails escaped/barreled components (docs §4.1/§4.2).
+   */
+  forcedBails?: ComponentId[];
 }
 
 /**

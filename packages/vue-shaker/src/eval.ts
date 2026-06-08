@@ -6,6 +6,25 @@ export type EvalResult = { known: true; value: Literal } | { known: false };
 const UNKNOWN: EvalResult = { known: false };
 
 /**
+ * If `node` is a non-computed `props.X` member read on the props local, return
+ * `X`; otherwise null.  Lets the evaluator treat the non-destructured props form
+ * (`const props = defineProps()`; reads `props.size`) like a bare prop name.
+ */
+export function propsMemberName(node: AnyNode, propsLocal: string | undefined): string | null {
+  if (
+    propsLocal &&
+    node.type === 'MemberExpression' &&
+    node.computed !== true &&
+    node.object?.type === 'Identifier' &&
+    node.object.name === propsLocal &&
+    node.property?.type === 'Identifier' &&
+    node.property.name
+  )
+    return node.property.name;
+  return null;
+}
+
+/**
  * A deliberately tiny, total constant evaluator over an ESTree/Babel expression,
  * given an environment of statically-known identifiers.  It never throws and
  * never guesses: anything it cannot prove is `{ known: false }`.
@@ -18,7 +37,11 @@ const UNKNOWN: EvalResult = { known: false };
  * docs/ARCHITECTURE.md §13 — same contract (sound over-approximation, falls to
  * unknown on non-distributive ops), just without the interprocedural lattice.
  */
-export function evaluate(node: AnyNode | null | undefined, env: Map<string, Literal>): EvalResult {
+export function evaluate(
+  node: AnyNode | null | undefined,
+  env: Map<string, Literal>,
+  propsLocal?: string,
+): EvalResult {
   if (!node) return UNKNOWN;
   switch (node.type) {
     // ESTree literal (some tooling paths) and Babel's split literal nodes.
@@ -37,8 +60,15 @@ export function evaluate(node: AnyNode | null | undefined, env: Map<string, Lite
       return UNKNOWN;
     }
 
+    // Non-destructured props are read as `props.X`; resolve to the prop's value.
+    case 'MemberExpression': {
+      const name = propsMemberName(node, propsLocal);
+      if (name != null && env.has(name)) return { known: true, value: env.get(name)! };
+      return UNKNOWN;
+    }
+
     case 'UnaryExpression': {
-      const arg = evaluate(node.argument, env);
+      const arg = evaluate(node.argument, env, propsLocal);
       if (!arg.known) return UNKNOWN;
       const v = arg.value;
       switch (node.operator) {
@@ -58,23 +88,25 @@ export function evaluate(node: AnyNode | null | undefined, env: Map<string, Lite
     }
 
     case 'LogicalExpression': {
-      const left = evaluate(node.left, env);
+      const left = evaluate(node.left, env, propsLocal);
       if (!left.known) return UNKNOWN;
       switch (node.operator) {
         case '&&':
-          return left.value ? evaluate(node.right, env) : left;
+          return left.value ? evaluate(node.right, env, propsLocal) : left;
         case '||':
-          return left.value ? left : evaluate(node.right, env);
+          return left.value ? left : evaluate(node.right, env, propsLocal);
         case '??':
-          return left.value === null || left.value === undefined ? evaluate(node.right, env) : left;
+          return left.value === null || left.value === undefined
+            ? evaluate(node.right, env, propsLocal)
+            : left;
         default:
           return UNKNOWN;
       }
     }
 
     case 'BinaryExpression': {
-      const left = evaluate(node.left, env);
-      const right = evaluate(node.right, env);
+      const left = evaluate(node.left, env, propsLocal);
+      const right = evaluate(node.right, env, propsLocal);
       if (!left.known || !right.known) return UNKNOWN;
       const l = left.value;
       const r = right.value;
